@@ -72,13 +72,21 @@ pub struct RerandomizationArguments {
 ### Prerequisites
 
 - Rust 1.86+
-- MPC repo with PoCs in `crates/node/src/requests/queue.rs` (mod tests)
-- **Required**: `CARGO_TARGET_DIR` without spaces (jemalloc fails with paths like `olas audit`)
+- MPC repo (clone or use existing)
+- **Required**: `CARGO_TARGET_DIR` without spaces — jemalloc fails if path has spaces (e.g. `olas audit`)
 
-### Run All 3 PoCs
+### Complete setup
 
 ```bash
-cd /path/to/mpc
+# 1. Clone MPC repo (or cd to your existing clone)
+git clone https://github.com/olas-network/mpc.git
+cd mpc
+
+# 2. Add the 3 PoC tests to crates/node/src/requests/queue.rs
+#    (inside #[cfg(test)] mod tests { ... })
+#    See §5 below for exact code.
+
+# 3. Run all 3 PoCs
 CARGO_TARGET_DIR=/tmp/mpc-target cargo test -p mpc-node test_entropy --no-fail-fast
 ```
 
@@ -86,13 +94,15 @@ Expected: `3 passed`.
 
 ---
 
-## 5. PoC Code
+## 5. PoC Code (exact code from queue.rs)
 
 Add these tests to `crates/node/src/requests/queue.rs` inside the existing `#[cfg(test)] mod tests { ... }` block.
 
 ### PoC 1: Root cause — entropy from non-final blocks is used
 
 ```rust
+/// Proves H-1 (Entropy Used Before Block Finality): requests indexed from OptimisticAndCanonical
+/// (non-final) blocks are processed and their entropy is used for signing.
 #[test]
 fn test_entropy_used_before_finality_optimistic_blocks_processed() {
     use crate::requests::recent_blocks_tracker::tests::Tester;
@@ -116,6 +126,7 @@ fn test_entropy_used_before_finality_optimistic_blocks_processed() {
             network_api.clone(),
         );
 
+    // Build chain: b10 -> b11 -> b12 -> b13 -> b14 -> b15
     let mut tester = Tester::new(6);
     let b10 = tester.block(10);
     let b11 = b10.child(11);
@@ -149,6 +160,9 @@ fn test_entropy_used_before_finality_optimistic_blocks_processed() {
 ### PoC 2: Validator influence — reorg scenario
 
 ```rust
+/// Proves VALIDATOR INFLUENCE: A validator can choose which block to finalize, hence which
+/// entropy is used. Request from block b16 (canonical) uses entropy X. After reorg, b16 becomes
+/// NotIncluded — we used entropy from a block the validator could have replaced.
 #[test]
 fn test_entropy_reorg_validator_influence() {
     use crate::requests::recent_blocks_tracker::tests::Tester;
@@ -172,6 +186,8 @@ fn test_entropy_reorg_validator_influence() {
             network_api.clone(),
         );
 
+    // Fork: b10->b11->b12, then b14 from b12, b16 from b12. Also b13 from b12, b15 from b13.
+    // Canonical chain: b12->b14->b16. Fork: b12->b13->b15.
     let mut tester = Tester::new(6);
     let b10 = tester.block(10);
     let b11 = b10.child(11);
@@ -188,8 +204,10 @@ fn test_entropy_reorg_validator_influence() {
     tester.add(&b16, "16");
     tester.add(&b15, "15");
 
+    // b16 is canonical (OptimisticAndCanonical)
     assert_eq!(tester.check(&b16), CheckBlockResult::OptimisticAndCanonical);
 
+    // Request from b16 with entropy X (simulates block.header.random_value)
     let entropy_from_b16 = [0xDE; 32];
     let req = test_sign_request(&participants, &[0]);
     let mut req_b16 = req.clone();
@@ -202,6 +220,7 @@ fn test_entropy_reorg_validator_influence() {
     assert_eq!(to_attempt.len(), 1);
     assert_eq!(to_attempt[0].request.entropy, entropy_from_b16);
 
+    // REORG: Extend b14's fork (b18, b19, b20). b16 becomes NotIncluded.
     let b18 = b14.child(18);
     let b19 = b18.child(19);
     let b20 = b19.child(20);
@@ -209,13 +228,21 @@ fn test_entropy_reorg_validator_influence() {
     tester.add(&b19, "19");
     tester.add(&b20, "20");
 
-    assert_eq!(tester.check(&b16), CheckBlockResult::NotIncluded);
+    assert_eq!(
+        tester.check(&b16),
+        CheckBlockResult::NotIncluded,
+        "VALIDATOR INFLUENCE: b16 (whose entropy we used) is now reorged. \
+         The validator chose to finalize b14's fork instead — they controlled which entropy we used."
+    );
 }
 ```
 
 ### PoC 3: Cryptographic weakening — different entropy → different delta
 
 ```rust
+/// Proves CRYPTOGRAPHIC WEAKENING: Different entropy → different rerandomization scalar (delta).
+/// GS21 requires entropy to be "unpredictable". When a validator controls it, biased entropy
+/// weakens rerandomization.
 #[test]
 fn test_entropy_biases_rerandomization() {
     use rand::SeedableRng;
@@ -241,15 +268,20 @@ fn test_entropy_biases_rerandomization() {
     );
     let delta_unpredictable = args.derive_randomness().unwrap();
 
-    let biased_entropy = [0x41; 32];
+    // Attacker-controlled entropy (e.g. from block.header.random_value validator chose)
+    let biased_entropy = [0x41; 32]; // "A" repeated — validator could bias toward this
     args.entropy = biased_entropy;
     let delta_biased = args.derive_randomness().unwrap();
 
-    assert_ne!(delta_unpredictable, delta_biased);
+    assert_ne!(
+        delta_unpredictable, delta_biased,
+        "CRYPTOGRAPHIC WEAKENING: Different entropy produces different rerandomization scalar. \
+         Biased entropy (validator-controlled random_value) breaks GS21's unpredictability requirement."
+    );
 }
 ```
 
-**Required imports** (already in the tests module): `TestBlockMaker`, `CheckBlockResult`, `test_sign_request`, `FakeClock`, `CHECK_EACH_REQUEST_INTERVAL`, etc. PoC 3 needs `rand::SeedableRng` and `threshold_signatures` types.
+**Imports**: PoC 1 & 2 use the existing test module imports. PoC 3 needs `rand::SeedableRng`, `threshold_signatures::ecdsa::Secp256K1Sha256`, `threshold_signatures::frost_core::Ciphersuite`, `threshold_signatures::frost_core::VerifyingKey`, and `threshold_signatures::test_utils::*`.
 
 ## 6. Step-by-Step Attack Scenario
 
@@ -262,11 +294,7 @@ fn test_entropy_biases_rerandomization() {
 
 ## 7. Recommended Fix
 
-Use entropy only from finalized blocks:
-
-1. **Option A**: Wait for `final_head` before processing requests that include entropy.
-2. **Option B**: Only process requests when `CheckBlockResult::RecentAndFinal` (exclude `OptimisticAndCanonical`).
-3. **Option C**: Set `finality: Final` in indexer config instead of `optimistic`.
+Use entropy only from finalized blocks: only process requests when `CheckBlockResult::RecentAndFinal` (exclude `OptimisticAndCanonical`).
 
 ## 8. References
 
