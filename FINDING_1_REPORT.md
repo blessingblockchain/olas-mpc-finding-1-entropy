@@ -2,7 +2,7 @@
 
 ## 1. Title
 
-Entropy from `streamer_message.block.header.random_value` is used for Sign, CKD, and VerifyForeignTx requests as soon as blocks are received, without checking finality. The queue processes requests for `OptimisticAndCanonical` blocks. A validator who controls block production can observe and bias this entropy before finality, weakening GS21 rerandomization and enabling potential key extraction.
+Entropy from `streamer_message.block.header.random_value` is used for Sign, CKD, and VerifyForeignTx requests as soon as blocks are received, without checking finality. The queue processes requests for `OptimisticAndCanonical` blocks. A validator who controls block production can observe and bias this entropy before finality, weakening GS21 rerandomization.
 
 ## 2. Vulnerability Details
 
@@ -49,7 +49,6 @@ pub struct RerandomizationArguments {
 | 1. Root cause | Entropy from non-final blocks is used | `test_entropy_used_before_finality_optimistic_blocks_processed` |
 | 2. Validator influence | Validator can choose which block to finalize → controls which entropy is used | `test_entropy_reorg_validator_influence` |
 | 3. Cryptographic weakening | Different entropy → different rerandomization scalar | `test_entropy_biases_rerandomization` |
-| 4. Key extraction | Biased entropy can enable cube-root attack (theory) | Documented in GS21 |
 
 ### Attack Scenario
 
@@ -59,7 +58,7 @@ pub struct RerandomizationArguments {
 4. Validator uses influence to get B finalized instead of A.
 5. Node already used entropy X from block A (now reorged). Validator chose which entropy was used.
 6. With repeated influence, validator can bias entropy distribution.
-7. Biased entropy breaks GS21 unpredictability → weak rerandomization → potential key extraction.
+7. Biased entropy breaks GS21 unpredictability → weak rerandomization.
 
 ## 3. Impact
 
@@ -67,7 +66,6 @@ pub struct RerandomizationArguments {
 
 - **Validator influence**: A block producer controls `random_value`; with optimistic finality, entropy can be biased.
 - **Cryptographic weakening**: GS21 rerandomization assumes unpredictable entropy. Biased entropy weakens the security proof.
-- **Key extraction risk**: In theory, weak rerandomization can enable cube-root attacks on the threshold signature scheme.
 
 ## 4. Validation Steps
 
@@ -142,7 +140,7 @@ Uses `RerandomizationArguments::derive_randomness()` with (a) unpredictable entr
 3. **Processing**: Queue classifies block as `OptimisticAndCanonical`. Request is selected for signing. Entropy flows to `RerandomizationArguments`.
 4. **Influence**: Validator observes `random_value` before finality. They produce alternative block with different `random_value`. They use stake to get their preferred block finalized.
 5. **Bias**: Over many requests, validator biases entropy distribution. Rerandomization scalar `delta` becomes predictable.
-6. **Exploitation**: With biased entropy, GS21 security proof no longer holds. Cube-root attack may become feasible (theoretical).
+6. **Exploitation**: With biased entropy, GS21 security proof no longer holds.
 
 ## 8. Recommended Fix
 

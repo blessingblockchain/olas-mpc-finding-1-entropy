@@ -18,7 +18,6 @@ Security audit finding and PoC for the OLAS MPC node — entropy from non-final 
 | 1 | Entropy from non-final blocks is used | `test_entropy_used_before_finality_optimistic_blocks_processed` |
 | 2 | Validator can influence which entropy is used (reorg) | `test_entropy_reorg_validator_influence` |
 | 3 | Biased entropy → different rerandomization scalar | `test_entropy_biases_rerandomization` |
-| 4 | Key extraction (theory) | GS21 |
 
 ## Run the PoCs
 
