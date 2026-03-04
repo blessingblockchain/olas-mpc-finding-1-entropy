@@ -32,9 +32,11 @@ Expected: 3 tests passed.
 
 ## Contents
 
-- `FINDING_1_REPORT.md` — Full detailed report with root cause, impact, PoC descriptions, and fix
+- `FINDING_1_REPORT.md` — Full report with root cause, impact, **complete PoC code**, setup, and fix
 - `README.md` — This file
 
-## PoC Location
+## Setup
 
-PoCs are in the MPC repo: `crates/node/src/requests/queue.rs` (mod tests, ~lines 1375–1545).
+1. Clone the MPC repo (or use one with PoCs).
+2. Add the 3 PoC tests from `FINDING_1_REPORT.md` §5 to `crates/node/src/requests/queue.rs` (mod tests).
+3. Run: `CARGO_TARGET_DIR=/tmp/mpc-target cargo test -p mpc-node test_entropy --no-fail-fast`

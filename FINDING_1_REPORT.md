@@ -67,73 +67,191 @@ pub struct RerandomizationArguments {
 - **Validator influence**: A block producer controls `random_value`; with optimistic finality, entropy can be biased.
 - **Cryptographic weakening**: GS21 rerandomization assumes unpredictable entropy. Biased entropy weakens the security proof.
 
-## 4. Validation Steps
+## 4. Setup and Run
 
 ### Prerequisites
 
-- Rust toolchain (1.86+)
-- Clone the MPC repository
-- **Important**: Use `CARGO_TARGET_DIR` without spaces (jemalloc build fails with paths containing spaces)
+- Rust 1.86+
+- MPC repo with PoCs in `crates/node/src/requests/queue.rs` (mod tests)
+- **Required**: `CARGO_TARGET_DIR` without spaces (jemalloc fails with paths like `olas audit`)
 
-### Run All PoCs
+### Run All 3 PoCs
 
 ```bash
-# Symlink or cd to mpc (avoid spaces in path for build)
 cd /path/to/mpc
-
-# Run all three entropy PoCs
 CARGO_TARGET_DIR=/tmp/mpc-target cargo test -p mpc-node test_entropy --no-fail-fast
 ```
 
-**Expected output:**
+Expected: `3 passed`.
 
+---
+
+## 5. PoC Code
+
+Add these tests to `crates/node/src/requests/queue.rs` inside the existing `#[cfg(test)] mod tests { ... }` block.
+
+### PoC 1: Root cause — entropy from non-final blocks is used
+
+```rust
+#[test]
+fn test_entropy_used_before_finality_optimistic_blocks_processed() {
+    use crate::requests::recent_blocks_tracker::tests::Tester;
+
+    init_logging(LogFormat::Plain);
+    let clock = FakeClock::default();
+    let participants =
+        into_participant_ids(&TestGenerators::new_contiguous_participant_ids(4, 3.into()));
+    let my_participant_id = participants[0];
+    let network_api = Arc::new(TestNetworkAPI::new(&participants));
+
+    for participant in &participants {
+        network_api.set_height(*participant, 100);
+    }
+
+    let mut pending_requests =
+        PendingRequests::<SignatureRequest, ChainSignatureRespondArgs>::new(
+            clock.clock(),
+            participants.clone(),
+            my_participant_id,
+            network_api.clone(),
+        );
+
+    let mut tester = Tester::new(6);
+    let b10 = tester.block(10);
+    let b11 = b10.child(11);
+    let b12 = b11.child(12);
+    let b13 = b12.child(13);
+    let b14 = b13.child(14);
+    let b15 = b14.child(15);
+
+    tester.add(&b11, "11");
+    tester.add(&b12, "12");
+    tester.add(&b13, "13");
+    tester.add(&b14, "14");
+    tester.add(&b15, "15");
+
+    assert_eq!(tester.check(&b14), CheckBlockResult::OptimisticAndCanonical);
+
+    let req = test_sign_request(&participants, &[0]);
+    let mut req_with_entropy = req.clone();
+    req_with_entropy.entropy = [0xAB; 32];
+
+    pending_requests.notify_new_block(vec![req_with_entropy], vec![], &b14.to_block_view());
+    clock.advance(CHECK_EACH_REQUEST_INTERVAL);
+
+    let to_attempt = pending_requests.get_requests_to_attempt();
+    assert_eq!(to_attempt.len(), 1);
+    assert_eq!(to_attempt[0].request.id, req.id);
+    assert_eq!(to_attempt[0].request.entropy, [0xAB; 32]);
+}
 ```
-running 3 tests
-test requests::queue::tests::test_entropy_biases_rerandomization ... ok
-test requests::queue::tests::test_entropy_used_before_finality_optimistic_blocks_processed ... ok
-test requests::queue::tests::test_entropy_reorg_validator_influence ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 205 filtered out; finished in 0.01s
+### PoC 2: Validator influence — reorg scenario
+
+```rust
+#[test]
+fn test_entropy_reorg_validator_influence() {
+    use crate::requests::recent_blocks_tracker::tests::Tester;
+
+    init_logging(LogFormat::Plain);
+    let clock = FakeClock::default();
+    let participants =
+        into_participant_ids(&TestGenerators::new_contiguous_participant_ids(4, 3.into()));
+    let my_participant_id = participants[0];
+    let network_api = Arc::new(TestNetworkAPI::new(&participants));
+
+    for participant in &participants {
+        network_api.set_height(*participant, 100);
+    }
+
+    let mut pending_requests =
+        PendingRequests::<SignatureRequest, ChainSignatureRespondArgs>::new(
+            clock.clock(),
+            participants.clone(),
+            my_participant_id,
+            network_api.clone(),
+        );
+
+    let mut tester = Tester::new(6);
+    let b10 = tester.block(10);
+    let b11 = b10.child(11);
+    let b12 = b11.child(12);
+    let b13 = b12.child(13);
+    let b14 = b12.child(14);
+    let b15 = b13.child(15);
+    let b16 = b12.child(16);
+
+    tester.add(&b11, "11");
+    tester.add(&b12, "12");
+    tester.add(&b13, "13");
+    tester.add(&b14, "14");
+    tester.add(&b16, "16");
+    tester.add(&b15, "15");
+
+    assert_eq!(tester.check(&b16), CheckBlockResult::OptimisticAndCanonical);
+
+    let entropy_from_b16 = [0xDE; 32];
+    let req = test_sign_request(&participants, &[0]);
+    let mut req_b16 = req.clone();
+    req_b16.entropy = entropy_from_b16;
+
+    pending_requests.notify_new_block(vec![req_b16], vec![], &b16.to_block_view());
+    clock.advance(CHECK_EACH_REQUEST_INTERVAL);
+
+    let to_attempt = pending_requests.get_requests_to_attempt();
+    assert_eq!(to_attempt.len(), 1);
+    assert_eq!(to_attempt[0].request.entropy, entropy_from_b16);
+
+    let b18 = b14.child(18);
+    let b19 = b18.child(19);
+    let b20 = b19.child(20);
+    tester.add(&b18, "18");
+    tester.add(&b19, "19");
+    tester.add(&b20, "20");
+
+    assert_eq!(tester.check(&b16), CheckBlockResult::NotIncluded);
+}
 ```
 
-### Run Individual PoCs
+### PoC 3: Cryptographic weakening — different entropy → different delta
 
-```bash
-# PoC 1: Root cause — entropy from non-final blocks is used
-CARGO_TARGET_DIR=/tmp/mpc-target cargo test -p mpc-node test_entropy_used_before_finality_optimistic_blocks_processed --no-fail-fast
+```rust
+#[test]
+fn test_entropy_biases_rerandomization() {
+    use rand::SeedableRng;
+    use threshold_signatures::ecdsa::Secp256K1Sha256;
+    use threshold_signatures::frost_core::Ciphersuite;
+    use threshold_signatures::test_utils::{
+        ecdsa_generate_rerandpresig_args, generate_participants_with_random_ids,
+        MockCryptoRng,
+    };
 
-# PoC 2: Validator influence — reorg scenario
-CARGO_TARGET_DIR=/tmp/mpc-target cargo test -p mpc-node test_entropy_reorg_validator_influence --no-fail-fast
+    let mut rng = MockCryptoRng::seed_from_u64(42);
+    let participants = generate_participants_with_random_ids(3, &mut rng);
+    let (_, big_r) = Secp256K1Sha256::generate_nonce(&mut rng);
+    let (_, pk) = Secp256K1Sha256::generate_nonce(&mut rng);
+    let pk = threshold_signatures::frost_core::VerifyingKey::new(pk);
+    let big_r = big_r.to_affine();
 
-# PoC 3: Cryptographic weakening — different entropy → different delta
-CARGO_TARGET_DIR=/tmp/mpc-target cargo test -p mpc-node test_entropy_biases_rerandomization --no-fail-fast
+    let (mut args, _msg_hash) = ecdsa_generate_rerandpresig_args(
+        &mut rng,
+        &participants,
+        pk,
+        big_r,
+    );
+    let delta_unpredictable = args.derive_randomness().unwrap();
+
+    let biased_entropy = [0x41; 32];
+    args.entropy = biased_entropy;
+    let delta_biased = args.derive_randomness().unwrap();
+
+    assert_ne!(delta_unpredictable, delta_biased);
+}
 ```
 
-## 5. PoC Code Locations
+**Required imports** (already in the tests module): `TestBlockMaker`, `CheckBlockResult`, `test_sign_request`, `FakeClock`, `CHECK_EACH_REQUEST_INTERVAL`, etc. PoC 3 needs `rand::SeedableRng` and `threshold_signatures` types.
 
-All PoCs are in `crates/node/src/requests/queue.rs` (mod tests):
-
-| PoC | Test name | Lines |
-|-----|-----------|-------|
-| 1 | `test_entropy_used_before_finality_optimistic_blocks_processed` | ~1378–1429 |
-| 2 | `test_entropy_reorg_validator_influence` | ~1434–1505 |
-| 3 | `test_entropy_biases_rerandomization` | ~1511–1545 |
-
-## 6. PoC Descriptions
-
-### PoC 1: Root Cause
-
-Builds chain b10→b11→b12→b13→b14→b15. Block b14 is `OptimisticAndCanonical` (not final). Adds sign request with entropy `[0xAB; 32]` from b14. Asserts the request is selected for attempt and entropy is passed through. **Proves**: entropy from non-final blocks is used for signing.
-
-### PoC 2: Validator Influence
-
-Builds fork: b12→b14→b16 (canonical) vs b12→b13→b15. Request from b16 with entropy `[0xDE; 32]` is processed. Then reorg: add b18, b19, b20 from b14's fork. b16 becomes `NotIncluded`. **Proves**: we used entropy from a block the validator could have replaced by finalizing a different fork.
-
-### PoC 3: Cryptographic Weakening
-
-Uses `RerandomizationArguments::derive_randomness()` with (a) unpredictable entropy and (b) biased entropy `[0x41; 32]`. Asserts `delta_a != delta_biased`. **Proves**: different entropy produces different rerandomization scalar; validator-controlled entropy breaks GS21 unpredictability.
-
-## 7. Step-by-Step Attack Scenario
+## 6. Step-by-Step Attack Scenario
 
 1. **Reconnaissance**: Attacker is a NEAR validator. They produce blocks and control `random_value` in each block header.
 2. **Indexing**: MPC node runs with `finality: optimistic`. Sign request appears in block at height H. Handler sets `entropy = block.header.random_value`.
@@ -142,7 +260,7 @@ Uses `RerandomizationArguments::derive_randomness()` with (a) unpredictable entr
 5. **Bias**: Over many requests, validator biases entropy distribution. Rerandomization scalar `delta` becomes predictable.
 6. **Exploitation**: With biased entropy, GS21 security proof no longer holds.
 
-## 8. Recommended Fix
+## 7. Recommended Fix
 
 Use entropy only from finalized blocks:
 
@@ -150,7 +268,7 @@ Use entropy only from finalized blocks:
 2. **Option B**: Only process requests when `CheckBlockResult::RecentAndFinal` (exclude `OptimisticAndCanonical`).
 3. **Option C**: Set `finality: Final` in indexer config instead of `optimistic`.
 
-## 9. References
+## 8. References
 
 - [GS21] https://eprint.iacr.org/2021/1330.pdf — Presignature rerandomization
 - NEAR block finality: optimistic vs final
